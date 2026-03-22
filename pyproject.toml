@@ -27,7 +27,8 @@ dependencies = [
   "getmac==0.9.5",
   "mashumaro==3.18",
   "music-assistant-frontend==2.17.126",
-  "music-assistant-models==1.1.108",
+  # TEMPORARY: test music-assistant/models#155; revert to PyPI pin before upstreaming this PR
+  "music-assistant-models @ git+https://github.com/music-assistant/models.git@refs/pull/155/head",
   "mutagen==1.47.0",
   "orjson==3.11.6",
   "pillow==12.1.1",
