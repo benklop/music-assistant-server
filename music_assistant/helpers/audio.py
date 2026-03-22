@@ -634,9 +634,37 @@ async def get_media_stream(
             assert streamdetails.decryption_key is not None  # for type checking
             extra_input_args += ["-decryption_key", streamdetails.decryption_key]
         if isinstance(streamdetails.path, list):
-            # multi part stream
-            audio_source = get_multi_file_stream(mass, streamdetails, seek_position)
-            seek_position = 0  # handled by get_multi_file_stream
+            logger.debug(
+                "media_stream path list len=%s first_type=%s",
+                len(streamdetails.path),
+                type(streamdetails.path[0]).__name__ if streamdetails.path else None,
+            )
+            if not streamdetails.path:
+                raise InvalidDataError("Streamdetails.path list cannot be empty")
+            if all(isinstance(part, MultiPartPath) for part in streamdetails.path):
+                # One MultiPartPath with path: list[str] = same stream, URL failover/mirrors
+                first_part = streamdetails.path[0]
+                # Use object: full-project mypy narrows MultiPartPath.path to str in this context
+                first_paths: object = first_part.path
+                if len(streamdetails.path) == 1 and isinstance(first_paths, list):
+                    LOGGER.debug(
+                        "Using mirror URL list (count=%s) for %s",
+                        len(first_paths),
+                        streamdetails.uri,
+                    )
+                    audio_source = get_mirror_stream(mass, streamdetails)
+                    seek_position = 0  # no seeking in a radio stream
+                else:
+                    # multi part stream (each part.path is a single file URL/path)
+                    audio_source = get_multi_file_stream(mass, streamdetails, seek_position)
+                    seek_position = 0  # handled by get_multi_file_stream
+            else:
+                logger.error(
+                    "Unsupported path list contents for %s: %s",
+                    streamdetails.uri,
+                    [type(p).__name__ for p in streamdetails.path],
+                )
+                raise InvalidDataError("Streamdetails.path list must contain MultiPartPath")
         else:
             # regular single file/url stream
             assert isinstance(streamdetails.path, str)  # for type checking
@@ -1338,7 +1366,16 @@ async def get_multi_file_stream(
     if not isinstance(streamdetails.path, list):
         raise InvalidDataError("Multi-file streamdetails requires a list of MultiPartPath")
     parts, seek_position = _get_parts_from_position(streamdetails.path, seek_position)
-    files_list = [part.path for part in parts]
+    files_list: list[str] = []
+    for part in parts:
+        part_path: object = part.path
+        if isinstance(part_path, list):
+            raise InvalidDataError(
+                "Multi-file concat requires each part's path to be a string; "
+                "for URL mirrors use a single MultiPartPath with path=[urls]."
+            )
+        assert isinstance(part_path, str)
+        files_list.append(part_path)
 
     # concat input files
     temp_file = f"/tmp/{shortuuid.random(20)}.txt"  # noqa: S108
@@ -1370,6 +1407,76 @@ async def get_multi_file_stream(
             yield chunk
     finally:
         await remove_file(temp_file)
+
+
+async def get_mirror_stream(
+    mass: MusicAssistant,
+    streamdetails: StreamDetails,
+) -> AsyncGenerator[bytes, None]:
+    """Return audio stream from mirrored URLs.
+
+    Expects ``streamdetails.path`` to be ``[MultiPartPath(path=[url, ...])]`` where
+    list order is try-first through try-last (shared model with music-assistant-models).
+    """
+    if not isinstance(streamdetails.path, list):
+        raise InvalidDataError("Mirror streamdetails requires a list of MultiPartPath")
+
+    if len(streamdetails.path) != 1 or not isinstance(streamdetails.path[0], MultiPartPath):
+        raise InvalidDataError(
+            "Mirror streamdetails must be one MultiPartPath with path set to a list of URLs"
+        )
+
+    mirrors_raw: object = streamdetails.path[0].path
+    if not isinstance(mirrors_raw, list):
+        raise InvalidDataError(
+            "Mirror streamdetails must be one MultiPartPath with path set to a list of URLs"
+        )
+    mirrors = mirrors_raw
+    if not mirrors:
+        raise InvalidDataError("Mirror URL list cannot be empty")
+    if not all(isinstance(u, str) for u in mirrors):
+        raise InvalidDataError("Each mirror URL must be a string")
+
+    LOGGER.debug(
+        "Mirror stream start for %s with %s mirror(s)",
+        streamdetails.uri,
+        len(mirrors),
+    )
+
+    last_exception: Exception | None = None
+    for url in mirrors:
+        LOGGER.debug("Trying mirror %s for %s", url, streamdetails.uri)
+        try:
+            async for chunk in get_http_stream(
+                mass,
+                url,
+                streamdetails,
+                verify_ssl=True,
+            ):
+                yield chunk
+            return
+        except (
+            AudioError,
+            ProviderUnavailableError,
+            MediaNotFoundError,
+            aiohttp.ClientError,
+            TimeoutError,
+        ) as err:
+            LOGGER.warning(
+                "Error streaming from mirror %s for %s: %s",
+                url,
+                streamdetails.uri,
+                err,
+                exc_info=True,
+            )
+            last_exception = err
+
+    LOGGER.error(
+        "All mirror streams failed for %s (attempted %s)",
+        streamdetails.uri,
+        mirrors,
+    )
+    raise AudioError("All mirror streams failed") from last_exception
 
 
 async def get_preview_stream(
@@ -1703,8 +1810,20 @@ async def analyze_loudness(
             assert streamdetails.decryption_key is not None  # for type checking
             extra_input_args += ["-decryption_key", streamdetails.decryption_key]
         if isinstance(streamdetails.path, list):
-            # multi part stream - just use a single file for the measurement
-            audio_source = streamdetails.path[1].path
+            # Mirror URLs: one MultiPartPath whose path is a list of same-stream URLs
+            if len(streamdetails.path) == 1 and isinstance(streamdetails.path[0], MultiPartPath):
+                measure_paths: object = streamdetails.path[0].path
+                if isinstance(measure_paths, list) and measure_paths:
+                    audio_source = measure_paths[0]
+                elif isinstance(measure_paths, str):
+                    audio_source = measure_paths
+                else:
+                    raise InvalidDataError("Mirror URL list cannot be empty")
+            else:
+                # multi part stream - just use a single file for the measurement
+                multi_probe: object = streamdetails.path[1].path
+                assert isinstance(multi_probe, str)
+                audio_source = multi_probe
         else:
             # regular single file/url stream
             assert isinstance(streamdetails.path, str)  # for type checking

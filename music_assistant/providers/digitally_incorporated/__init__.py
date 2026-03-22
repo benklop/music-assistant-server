@@ -15,7 +15,7 @@ The provider requires a premium account and listen key for authentication.
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import aiohttp
 from music_assistant_models.enums import (
@@ -38,7 +38,7 @@ from music_assistant_models.media_items import (
     SearchResults,
     UniqueList,
 )
-from music_assistant_models.streamdetails import StreamDetails
+from music_assistant_models.streamdetails import MultiPartPath, StreamDetails
 
 from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.throttle_retry import Throttler
@@ -72,7 +72,7 @@ API_BASE_URL = "api.audioaddict.com/v1"
 API_TIMEOUT = 30
 CACHE_CHANNELS = 86400  # 24 hours
 CACHE_GENRES = 86400  # 24 hours
-CACHE_STREAM_URL = 3600  # 1 hour
+CACHE_STREAM_URLS = 3600  # 1 hour
 
 # Rate limiting
 RATE_LIMIT = 2  # requests per period
@@ -333,8 +333,8 @@ class DigitallyIncorporatedProvider(MusicProvider):
         # Validate and parse the provider ID
         network_key, channel_key = self._validate_item_id(item_id)
 
-        # Get the stream URL
-        stream_url = await self._get_stream_url(network_key, channel_key)
+        # Get stream path: one MultiPartPath, either a single URL or a list of mirror URLs
+        stream_path = await self._get_stream_path(network_key, channel_key)
 
         return StreamDetails(
             provider=self.instance_id,
@@ -343,8 +343,9 @@ class DigitallyIncorporatedProvider(MusicProvider):
                 content_type=ContentType.UNKNOWN,  # Let ffmpeg auto-detect
             ),
             media_type=MediaType.RADIO,
-            stream_type=StreamType.ICY,
-            path=stream_url,
+            # Use HTTP stream type with mirrors so we can try multiple URLs
+            stream_type=StreamType.HTTP,
+            path=stream_path,
             allow_seek=False,
             can_seek=False,
             duration=0,  # Infinite duration for radio streams
@@ -606,9 +607,9 @@ class DigitallyIncorporatedProvider(MusicProvider):
             )
             return {}
 
-    @use_cache(CACHE_STREAM_URL)
-    async def _get_stream_url(self, network_key: str, channel_key: str) -> str:
-        """Get the streaming URL for a channel."""
+    @use_cache(CACHE_STREAM_URLS)
+    async def _get_stream_path(self, network_key: str, channel_key: str) -> list[MultiPartPath]:
+        """Get stream path for a channel (mirrors as one MultiPartPath, see models)."""
         self.logger.debug("%s: Getting stream URL for %s:%s", self.domain, network_key, channel_key)
 
         listen_key = self.config.get_value("listen_key")
@@ -622,28 +623,31 @@ class DigitallyIncorporatedProvider(MusicProvider):
                 network_key, f"listen/premium_high/{channel_key}", use_https=True, **params
             )
 
-            # Use the first stream URL from the playlist
-            self.logger.debug(
-                "%s: Digitally Incorporated playlist returned %d URLs", self.domain, len(playlist)
-            )
             if not playlist or not isinstance(playlist, list):
                 msg = f"{self.domain}: No stream URLs returned from Digitally Incorporated API"
                 raise MediaNotFoundError(msg)
 
-            # Log all available URLs for debugging
-            for i, url in enumerate(playlist):
-                self.logger.debug("%s: Available stream URL %d: %s", self.domain, i + 1, url)
+            urls = [url for url in playlist if url and isinstance(url, str)]
 
-            # Use the first URL - Digitally Incorporated typically returns them in priority order
-            stream_url: str = str(playlist[0])
-            self.logger.debug("%s: Selected stream URL: %s", self.domain, stream_url)
+            self.logger.debug(
+                "%s: Filtered %d valid stream URLs from playlist of %d URLs",
+                self.domain,
+                len(urls),
+                len(playlist),
+            )
 
-            # Validate the stream URL
-            if not stream_url or not isinstance(stream_url, str):
-                msg = f"{self.domain}: Invalid stream URL received: {stream_url}"
+            if not urls:
+                msg = f"{self.domain}: No valid stream URLs found in the playlist"
                 raise MediaNotFoundError(msg)
 
-            return stream_url
+            # Log all available URLs
+            for i, url in enumerate(urls):
+                self.logger.debug("%s: Available stream URL %d: %s", self.domain, i + 1, url)
+
+            # Single URL: one part with str path; multiple: mirror list on one MultiPartPath
+            if len(urls) == 1:
+                return [MultiPartPath(path=urls[0])]
+            return [MultiPartPath(path=cast("Any", urls))]
 
         except (ProviderUnavailableError, MediaNotFoundError):
             # Re-raise provider/media errors as-is (they already have domain prefix)
